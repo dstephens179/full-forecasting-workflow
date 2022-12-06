@@ -1,0 +1,710 @@
+---
+title: "Nested Sales Forecast - by Tienda, Owner, Metal Type & Product"
+---
+
+PACKAGES
+```{r}
+# devtools::install_github("business-science/modeltime")
+# devtools::install_github("business-science/modeltime.ensemble")
+# devtools::install_github("business-science/timetk")
+# 
+# install.packages('ranger')
+# install.packages('trelliscopejs')
+# install.packages('modeltime.ensemble')
+# remotes::install_github("business-science/modeltime", dependencies = TRUE)
+```
+
+# LIBRARIES
+```{r setup, include=FALSE}
+# core packages
+library(tidyverse)
+library(timetk)
+library(tidyquant)
+library(janitor)
+
+
+# visualization
+library(gt)
+library(scales)
+library(plotly)
+
+
+# spreadsheet work
+library(readxl)
+library(openxlsx)
+library(googledrive)
+library(bigrquery)
+
+
+# time series ml
+library(tidymodels)
+library(modeltime)
+library(modeltime.ensemble)
+library(modeltime.resample)
+library(prophet)
+library(rules)
+library(trelliscopejs)
+library(ranger)
+library(randomForest)
+
+
+# Timing & Parallel Processing
+library(tictoc)
+library(future)
+library(doFuture)
+library(parallel)
+
+options(scipen = 999)
+
+
+date_today <- Sys.Date()
+
+```
+
+
+# DATA & PARAMETERS
+```{r}
+start_date <- '2015-07-01'
+end_date <- today()
+
+covid_start_date <- '2020-03-01'
+covid_end_date <- '2020-08-31'
+
+
+projectid = "source-data-314320"
+sql <- "SELECT 
+          tienda,
+          may_men,
+          date,
+          owner,
+          metal_type,
+          product_type,
+          sales
+        FROM `source-data-314320.Store_Data.All_Data`
+        WHERE sales <> 0
+        ORDER BY Date desc
+"
+
+
+# Run the query and store
+bq_query <- bq_project_query(projectid, sql)
+data_tbl <- bq_table_download(bq_query)
+
+```
+
+
+
+
+# 1.0 PREPARE DATASET
+
+## Clean dataset
+```{r}
+data_filtered_tbl <- data_tbl %>%
+  filter(!is.na(sales)) %>%
+  filter(date < end_date) %>%
+  filter(!(str_detect(product_type, "Bonif"))) %>%
+  
+  # filter(metal_type == "10" | metal_type == "14" | metal_type == "Diamante") %>%
+  
+  # filter(str_detect(tienda, "Centro") |
+  #        str_detect(tienda, "Pl.Patria") | 
+  #        str_detect(tienda,  "Vallardo") |
+  #        str_detect(tienda,  "En Linea") |
+  #        str_detect(tienda,  "Segovia") |
+  #        str_detect(tienda,  "Matriz") |
+  #        str_detect(tienda,  "Pasaje")) %>%
+  
+  mutate(combined = str_glue("{tienda}_{owner}_{metal_type}_{product_type}")) %>%
+  select(date, combined, sales) %>%
+  mutate(combined = as.factor(combined))
+# 
+# # fctr of unique products + first date
+# unique_combined <- data_filtered_tbl %>%
+#   dplyr::distinct(combined) %>%
+#   mutate(date = as.Date(start_date)) %>%
+#   mutate(sales = 0)
+# 
+# # bind rows
+# data_joined_tbl <- data_filtered_tbl %>%
+#   bind_rows(unique_combined)
+
+```
+
+
+## COVID - Not Included
+```{r, eval=FALSE}
+# create new table where covid date data is overwritten with prior year
+daily_data_covid_tbl <- data_filtered_tbl %>%
+  group_by(combined) %>%
+  mutate(date_1 = ymd(date) + years(1)) %>%
+  mutate(sales_1 = sales) %>%
+  filter(date_1 %within% interval(covid_start_date, covid_end_date)) %>%
+  mutate(date = date_1) %>%
+  mutate(sales = sales_1) %>%
+  select(date, sales) %>%
+  ungroup()
+
+
+# create new table without covid dates
+daily_data_drop_na_tbl <- data_filtered_tbl %>%
+  mutate(date_na = as.Date(ifelse(date %within% interval(covid_start_date, covid_end_date), NA, date))) %>%
+  drop_na() %>%
+  select(-date_na)
+
+# finally, bind rows
+daily_covid_corrected_tbl <- bind_rows(daily_data_drop_na_tbl, daily_data_covid_tbl) %>% arrange(date)
+
+```
+
+
+## Discovery
+```{r}
+# * Plot ACF ----
+
+data_filtered_tbl %>%
+  summarize_by_time(.date_var = date, .by = "week", value = sum(sales)) %>%
+  plot_acf_diagnostics(
+    .date_var = date,
+    .value    = diff_vec(value)
+  )
+
+```
+
+
+```{r}
+weekly_corrected_tbl <- data_filtered_tbl %>%
+  group_by(combined) %>%
+  pad_by_time(
+    .date_var = date,
+    .by = "day",
+    # .start_date = min(data_filtered_tbl$date),
+    .end_date = max(data_filtered_tbl$date),
+    .pad_value = 0
+  ) %>%
+  summarize_by_time(
+    .date_var = date,
+    .by = "week",
+    sales = sum(sales)
+  ) %>%
+  ungroup()
+
+
+# visualize
+weekly_corrected_tbl %>%
+  group_by(combined) %>%
+  plot_time_series(date,
+                   sales,
+                   .trelliscope = TRUE,
+                   .facet_ncol = 3,
+                   .facet_nrow = 1)
+
+
+weekly_corrected_tbl %>%
+  separate(combined, into = c('tienda', 'owner', 'metal_type', 'product_type'), sep = "\\_") %>%
+  group_by(tienda) %>%
+  summarize_by_time(.date_var = date, .by = "month", sales = sum(sales)) %>%
+  plot_time_series(.date_var = date, .value = sales, .smooth = FALSE)
+  
+```
+
+
+
+# 2.0 NESTED TIME SERIES
+```{r}
+nested_data_tbl <- weekly_corrected_tbl %>%
+  group_by(combined) %>%
+  extend_timeseries(
+    .id_var = combined,
+    .date_var = date,
+    .length_future = 22
+  ) %>%
+  nest_timeseries(
+    .id_var = combined,
+    .length_future = 22
+  ) %>%
+  split_nested_timeseries(
+    .length_test = 22
+  )
+```
+
+
+
+# 3.0 RECIPES
+```{r}
+recipe_spec <- recipe(sales ~., extract_nested_train_split(nested_data_tbl)) %>%
+  step_timeseries_signature(date) %>%
+  step_rm(matches("(.xts$)|(.iso$)|(hour)|(minute)|(second)|(am.pm)")) %>%
+  step_normalize(matches("(index.num)|(year)|(yday)")) %>%
+  step_dummy(all_nominal(), one_hot = TRUE)
+
+recipe_spec %>%
+  prep() %>%
+  juice() %>%
+  glimpse()
+
+
+
+recipe_spec_ml <- recipe(sales ~., extract_nested_train_split(nested_data_tbl)) %>%
+  step_timeseries_signature(date) %>%
+  step_rm(matches("(.xts$)|(.iso$)|(hour)|(minute)|(second)|(am.pm)")) %>%
+  step_normalize(matches("(index.num)|(year)|(yday)")) %>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>%
+  step_rm(date)
+
+recipe_spec_ml %>%
+  prep() %>%
+  juice() %>%
+  glimpse()
+
+
+bake(prep(recipe_spec), extract_nested_train_split(nested_data_tbl))
+bake(prep(recipe_spec_ml), extract_nested_train_split(nested_data_tbl))
+
+```
+
+# 4.0 ML MODELS
+```{r}
+# XGBoost Models
+wflw_xgb_1 <- workflow() %>%
+  add_model(boost_tree("regression", learn_rate = 0.35) %>% 
+              set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_ml)
+
+wflw_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression", learn_rate = 0.50) %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_ml)
+
+
+# Prophet Models
+wflw_prophet <- workflow() %>%
+  add_model(spec = prophet_reg() %>% set_engine("prophet")) %>%
+  add_recipe(recipe_spec)
+
+wflw_prophet_boost <- workflow() %>%
+  add_model(
+    spec = prophet_boost(
+      seasonality_daily = FALSE,
+      seasonality_weekly = FALSE,
+      seasonality_yearly = FALSE
+    ) %>%
+      set_engine("prophet_xgboost")
+  ) %>%
+  add_recipe(recipe_spec)
+
+
+# Random Forest
+set.seed(123)
+wflw_rf <- workflow() %>%
+  add_model(spec = rand_forest("regression") %>% set_engine("ranger")) %>%
+  add_recipe(recipe_spec_ml)
+
+
+# THIEF
+wflw_thief <- workflow() %>%
+  add_model(temporal_hierarchy() %>% set_engine("thief")) %>%
+  add_recipe(recipe_spec)
+```
+
+
+
+# 4.1 MODELS W/TUNE
+## Resamples - K-Fold
+```{r}
+set.seed(123)
+resamples_kfold <- extract_nested_train_split(nested_data_tbl) %>% vfold_cv(v = 5)
+
+resamples_kfold %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(
+    .date_var = date, 
+    .value = sales, 
+    .facet_ncol = 2
+  )
+```
+
+## XGBoost
+```{r}
+model_spec_xgboost_tune <- boost_tree(
+  mode           = "regression",
+  mtry           = tune(),
+  trees          = tune(),
+  min_n          = tune(),
+  tree_depth     = tune(),
+  learn_rate     = tune(),
+  loss_reduction = tune()
+) %>%
+  set_engine("xgboost")
+
+
+wflw_spec_xgboost_tune <- workflow() %>%
+  add_model(model_spec_xgboost_tune) %>%
+  add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+
+# ** Tuning
+set.seed(123)
+tune_results_xgboost <- wflw_spec_xgboost_tune %>%
+  tune_grid(
+    resamples = resamples_kfold,
+    param_info = parameters(wflw_spec_xgboost_tune) %>%
+      update(
+        learn_rate = learn_rate(range = c(0.001, 0.400), trans = NULL)
+      ),
+    grid = 10,
+    control = control_grid(verbose = TRUE, allow_par = TRUE)
+  )
+
+# ** Results
+tune_results_xgboost %>% show_best("rmse", n = Inf)
+
+# ** Finalize
+wflw_xgboost_tuned <- wflw_spec_xgboost_tune %>%
+  finalize_workflow(select_best(tune_results_xgboost, "rmse"))
+```
+
+## Random Forest
+```{r}
+model_spec_rf_tune <- rand_forest(
+  mode  = "regression",
+  mtry  = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger")
+
+
+wflw_spec_rf_tune <- workflow() %>%
+  add_model(model_spec_rf_tune) %>%
+  add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+
+# ** Tuning
+set.seed(123)
+tune_results_rf <- wflw_spec_rf_tune %>%
+  tune_grid(
+    resamples = resamples_kfold,
+    grid      = 5,
+    control   = control_grid(verbose = TRUE, allow_par = TRUE)
+  )
+
+
+# ** Results
+tune_results_rf %>% show_best("rmse", n = Inf)
+
+# ** Finalize
+wflw_rf_tuned <- wflw_spec_rf_tune %>%
+  finalize_workflow(select_best(tune_results_rf, "rmse"))
+```
+
+## Earth
+```{r}
+model_spec_earth_tune <- mars(
+  mode        = "regression",
+  num_terms   = tune(),
+  prod_degree = tune()
+) %>%
+  set_engine("earth")
+
+
+wflw_spec_earth_tune <- workflow() %>%
+  add_model(model_spec_earth_tune) %>%
+  add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+
+# ** Tuning
+set.seed(123)
+tune_results_earth <- wflw_spec_earth_tune %>%
+  tune_grid(
+    resamples = resamples_kfold,
+    grid      = 10,
+    control   = control_grid(verbose = TRUE, allow_par = TRUE)
+  )
+
+
+# ** Results
+tune_results_earth %>% show_best("rmse")
+
+# ** Finalize
+wflw_earth_tuned <- wflw_spec_earth_tune %>%
+  finalize_workflow(tune_results_earth %>% select_best("rmse"))
+```
+
+
+
+# 5.0 TESTING
+## Start with 1 time series
+```{r, eval=FALSE}
+parallel_stop()
+parallel_start(12)
+
+sample_tbl <- nested_data_tbl %>%
+  # slice(1) %>%
+  modeltime_nested_fit(
+    
+    model_list = list(
+      wflw_xgb_1,
+      wflw_xgb_2,
+      wflw_xgboost_tuned,
+      wflw_prophet,
+      wflw_prophet_boost,
+      wflw_rf,
+      wflw_rf_tuned,
+      wflw_earth_tuned,
+      wflw_thief
+    ),
+    
+    control = control_nested_fit(
+      verbose = TRUE,
+      allow_par = TRUE
+    )
+  )
+
+sample_tbl
+
+
+# check for errors
+sample_tbl %>% extract_nested_error_report()
+
+parallel_stop()
+```
+
+## Scale to all time series
+```{r}
+parallel_stop()
+parallel_start(12)
+
+nested_modeltime_tbl <- nested_data_tbl %>%
+  modeltime_nested_fit(
+    
+    model_list = list(
+      # wflw_xgb_1,
+      # wflw_xgb_2,
+      # wflw_xgboost_tuned,
+      # wflw_prophet,
+      wflw_prophet_boost
+      # wflw_rf,
+      # wflw_rf_tuned
+    ),
+    
+    control = control_nested_fit(
+      verbose = TRUE,
+      allow_par = TRUE
+    )
+  )
+
+nested_modeltime_tbl
+parallel_stop()
+```
+
+
+## Check Accuracy & Errors
+```{r}
+# check for errors
+error_report <- nested_modeltime_tbl %>% extract_nested_error_report()
+
+ids_small_timeseries <- as.vector(unique(error_report$combined))
+
+
+# review non-errors nest
+nested_modeltime_tbl %>%
+  filter(!combined %in% ids_small_timeseries) %>%
+  extract_nested_train_split()
+
+
+# check accuracy on testing data
+nested_modeltime_tbl %>%
+  extract_nested_test_accuracy() %>%
+  table_modeltime_accuracy()
+
+
+# visualize
+# nested_modeltime_tbl %>%
+#   extract_nested_test_forecast() %>%
+#   group_by(combined) %>%
+#   plot_modeltime_forecast(
+#     .facet_ncol = 3,
+#     .trelliscope = TRUE,
+#     .conf_interval_show = FALSE
+#   )
+
+
+# separate from errors for clean nest
+nested_modeltime_subset_tbl <- nested_modeltime_tbl %>%
+  filter(!combined %in% ids_small_timeseries)
+
+```
+
+
+# 6.0 SELECT BEST
+```{r}
+nested_best_tbl <- nested_modeltime_subset_tbl %>%
+  modeltime_nested_select_best(metric = "rmse")
+
+# visualize
+nested_best_tbl %>%
+  extract_nested_test_forecast() %>%
+  filter(as.numeric(combined) %in% 1:12) %>%
+  group_by(combined) %>%
+  plot_modeltime_forecast(.facet_ncol = 3,
+                          .conf_interval_show = FALSE)
+```
+
+
+# 7.0 REFIT & FORECAST
+```{r}
+parallel_stop()
+parallel_start(12)
+
+nested_best_refit_tbl <- nested_best_tbl %>%
+  modeltime_nested_refit(
+    control = control_refit(
+      verbose = TRUE,
+      allow_par = TRUE
+    )
+  )
+
+# check for errors (should be zero)
+nested_best_refit_tbl %>% extract_nested_error_report()
+
+
+# visualize future
+nested_best_refit_tbl %>%
+  extract_nested_future_forecast() %>%
+  group_by(combined) %>%
+  plot_modeltime_forecast(.facet_ncol = 3,
+                          .conf_interval_show = FALSE,
+                          .trelliscope = TRUE)
+
+
+# separate and check on high-level
+nested_best_refit_tbl %>%
+  extract_nested_future_forecast() %>%
+  separate(combined, into = c('tienda','owner','metal_type','product_type'), sep = "\\_") %>%
+  group_by(.model_id, .model_desc, .key, .index, tienda) %>%
+  mutate(
+    .model_desc = ifelse(.key == "actual", "actual", "forecast"),
+    .model_id = ifelse(.model_id >=1, 1, NA)) %>%
+  summarize_by_time(.by = "month", .value = sum(.value)) %>%
+  ungroup() %>%
+  arrange(.index) %>%
+  group_by(tienda) %>%
+  plot_modeltime_forecast(
+    .conf_interval_show = FALSE,
+    .trelliscope        = TRUE,
+    .facet_ncol         = 3,
+    .facet_nrow         = 2)
+
+
+
+best_forecast_models_tbl <- nested_best_refit_tbl %>%
+  extract_nested_future_forecast() %>%
+  filter(.key == 'prediction') %>%
+  separate(combined, into = c('tienda','owner','metal_type','product_type'), sep = "\\_") %>%
+  mutate(
+    .model_desc = ifelse(.key == "actual", "actual", "forecast"),
+    forecast = ifelse(.value<0, 0, round(.value, 0)),
+    date = .index) %>%
+  mutate(tienda              = tienda,
+         may_men             = "Menudeo",
+         date                = ymd(date), 
+         owner               = owner, 
+         metal_type          = metal_type,
+         linea               = NA,
+         product_type        = product_type, 
+         sales               = NA,
+         forecast            = forecast,
+         forecast_inventario = NA,
+         inventario          = NA,
+         nombre_cliente      = NA,
+         nombre_agente       = NA) %>%
+  select(tienda, may_men, date, owner, metal_type, linea, product_type, sales, forecast, inventario, forecast_inventario, nombre_cliente, nombre_agente)
+
+
+best_forecast_models_tbl %>% write_rds("00_models/best_forecast_models_tbl.rds")
+
+best_forecast_models_tbl <- read_rds("00_models/best_forecast_models_tbl.rds")
+
+
+parallel_stop()
+```
+
+
+
+
+
+# OPTIONAL: HANDLE ERRORS
+```{r eval=FALSE}
+# nest the timeseries with errors
+nested_data_small_ts_tbl <- weekly_corrected_tbl %>%
+  filter(combined %in% ids_small_timeseries) %>%
+  group_by(combined) %>%
+  extend_timeseries(.id_var = combined, .date_var = date, .length_future = 10) %>%
+  nest_timeseries(.id_var = combined, .length_future = 10) %>%
+  split_nested_timeseries(.length_test = 4)
+
+
+# fit, select best & refit
+nested_best_refit_small_ts_tbl <- nested_data_small_ts_tbl %>%
+  modeltime_nested_fit(
+    
+    model_list = list(
+      wflw_xgb_1,
+      wflw_xgb_2,
+      wflw_prophet,
+      wflw_prophet_boost,
+      wflw_rf
+      # wflw_thief
+    ),
+    
+    control = control_nested_fit(
+      verbose = TRUE,
+      allow_par = TRUE
+    )
+  ) %>%
+  modeltime_nested_select_best() %>%
+  modeltime_nested_refit()
+
+
+nested_best_refit_small_ts_tbl %>%
+  extract_nested_future_forecast() %>%
+  group_by(combined) %>%
+  plot_modeltime_forecast(.facet_ncol = 3)
+
+
+# recombine
+nested_best_refit_all_tbl <- nested_best_refit_tbl %>%
+  bind_rows(nested_best_refit_small_ts_tbl)
+
+# save rds
+nested_best_refit_all_tbl %>% write_rds("00_models/best_nested_models_tbl.rds")
+```
+
+# 8.0 UPDATE FUTURE
+```{r, eval=FALSE}
+parallel_stop()
+parallel_start(12)
+
+new_forecast_tbl <- nested_best_refit_tbl %>%
+  modeltime_nested_forecast(
+    h = 53,
+    conf_interval = 0.99,
+    control = control_nested_forecast(
+      verbose = TRUE,
+      allow_par = TRUE
+    )
+  )
+
+new_forecast_tbl %>%
+  group_by(combined) %>%
+  plot_modeltime_forecast(.facet_ncol = 3,
+                          .conf_interval_show = FALSE,
+                          .trelliscope = TRUE)
+
+parallel_stop()
+```
+
+
+
+
+
+
