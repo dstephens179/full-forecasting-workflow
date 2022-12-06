@@ -65,10 +65,8 @@ horizon <- 16
 
 # DATA & PARAMETERS
 ```{r}
-
-# filter for the last Sunday where you have the most amount of data
 start_date <- '2015-07-01'
-end_date <- '2022-08-28'
+end_date <- today()
 
 covid_start_date <- '2020-03-01'
 covid_end_date <- '2020-08-31'
